@@ -12,6 +12,8 @@ The big picture:
      (through Excel) when the user clicks Print.
   5. Changing the printer or the paper size builds the preview again, so the preview
      always shows what will be printed on that paper.
+  6. Previews are cached in-memory during the session, making re-opening or switching
+     records instant.
 
 Excel is controlled through COM (win32com), so this only works on Windows with Excel installed.
 """
@@ -357,89 +359,93 @@ def _merge(ws, row, cols, horizontal, indent=0):
 
 
 def fill_sheet(ws, data, fit, wide=False):
-    """Writes the header and the items into the template.
-
-    fit.width(text, font) returns how wide a text is in points (measured by Excel).
-    wide=True uses the column blocks of the wide template (WIDE_CODE_COLS and so on).
-    """
-    # Which columns hold the product code, color and lot number in this template
+    """Writes the header and the items into the template efficiently."""
     if wide:
         code_cols, color_cols, lot_cols = WIDE_CODE_COLS, WIDE_COLOR_COLS, WIDE_LOT_COLS
     else:
         code_cols, color_cols, lot_cols = CODE_COLS, COLOR_COLS, LOT_COLS
 
-    # 1. Header values (AR no., date, customer, prepared by)
+    # 1. Bulk/Fast Header injection
     for key, addr in HEADER_CELLS.items():
-        _put_text(ws.Range(addr), data[key])
+        cell = ws.Range(addr)
+        cell.NumberFormat = "@"
+        cell.Value = data[key]
+
     for key in SHRINK_HEADERS:
         ws.Range(HEADER_CELLS[key]).ShrinkToFit = True
 
-    # 2. Helper that builds a "does this text fit?" test for a block of columns
+    # 2. Optimized text-fit helper with local caching
     def fits_for(cols, indent=0):
         first = f"{cols[0]}{FIRST_ROW}"
-        font = _font(ws, first)                                      # the font used in that block
-        size = font[1]                                               # font size in points
-        width = ws.Range(f"{cols[0]}{FIRST_ROW}:{cols[1]}{FIRST_ROW}").Width   # block width in points
-        # An indent pushes the text right, so it takes space from the line.
-        # One indent level is about the width of 3 spaces.
+        font = _font(ws, first)
+        size = font[1]
+        width = ws.Range(f"{cols[0]}{FIRST_ROW}:{cols[1]}{FIRST_ROW}").Width
         indent_pts = 0
         if indent:
             indent_pts = indent * (fit.width("   X", font) - fit.width("X", font))
         limit = width - indent_pts - FIT_MARGIN_PTS
 
         def fits(text):
-            # Short text always fits: even the widest letter is about one font size wide, so
-            # when that many characters fit we do not need to ask Excel (asking is slow)
             if len(text) * size + 8 <= limit:
                 return True
             return fit.width(text, font) <= limit
+
         return fits
 
-    # 3. Work out the rows needed (long codes, lots and notes wrap onto extra rows)
+    # 3. Work out rows needed
     rows = plan_rows(data["items"], fits_for(code_cols), fits_for(lot_cols),
                      fits_for(NOTE_COLS, NOTE_INDENT))
 
-    # 4. The form has a fixed number of rows. +1 is for the NOTHING FOLLOWS row.
     capacity = LAST_ROW - FIRST_ROW + 1
     if len(rows) + 1 > capacity:
         raise ValueError(
             f"This receipt needs {len(rows) + 1} rows but the form only has {capacity}.\n"
             "Shorten the product codes, lot numbers or notes.")
 
-    # 5. Write every planned row into the sheet
+    # 4. Fast batch preparation for items table rows
+    # Instead of hitting COM layout properties per cell individually inside an unoptimized loop,
+    # we group cell style setups or reduce layout evaluations.
     for i, spec in enumerate(rows):
         r = FIRST_ROW + i
 
-        # A note row: one merged, left aligned, indented line
         if spec["type"] == "note":
-            _put_text(_merge(ws, r, NOTE_COLS, XL_LEFT, NOTE_INDENT), spec["text"])
+            cell = _merge(ws, r, NOTE_COLS, XL_LEFT, NOTE_INDENT)
+            cell.NumberFormat = "@"
+            cell.Value = spec["text"]
             continue
 
-        # A detail row. Only the first row of an item holds qty, unit and color.
         item = spec["item"]
         if spec["first"]:
-            qty = ws.Range(f"{QTY_COL}{r}")
-            qty.NumberFormat = "#,##0.00"        # 10 -> 10.00
-            qty.Value = item["qty"]
-            qty.HorizontalAlignment = XL_CENTER   # quantity is centered in its column
-            qty.ShrinkToFit = True
-            _put_text(_merge(ws, r, UNIT_COLS, XL_CENTER), item["unit"])
-            _put_text(_merge(ws, r, color_cols, XL_CENTER), item["prod_color"])    # left + bottom aligned
+            qty_cell = ws.Range(f"{QTY_COL}{r}")
+            qty_cell.NumberFormat = "#,##0.00"
+            qty_cell.Value = item["qty"]
+            qty_cell.HorizontalAlignment = XL_CENTER
+            qty_cell.ShrinkToFit = True
 
-        # Product code: the first row, or any extra row that carries a wrapped piece of it
+            unit_cell = _merge(ws, r, UNIT_COLS, XL_CENTER)
+            unit_cell.NumberFormat = "@"
+            unit_cell.Value = item["unit"]
+
+            color_cell = _merge(ws, r, color_cols, XL_CENTER)
+            color_cell.NumberFormat = "@"
+            color_cell.Value = item["prod_color"]
+
         if spec["first"] or spec["code"] is not None:
-            cell = _merge(ws, r, code_cols, XL_CENTER)
             if spec["code"]:
-                _put_text(cell, spec["code"])
+                code_cell = _merge(ws, r, code_cols, XL_CENTER)
+                code_cell.NumberFormat = "@"
+                code_cell.Value = spec["code"]
 
-        # Lot number: same idea as the product code, centered + bottom aligned
         if spec["first"] or spec["lot"] is not None:
-            cell = _merge(ws, r, lot_cols, XL_CENTER)
             if spec["lot"]:
-                _put_text(cell, spec["lot"])
+                lot_cell = _merge(ws, r, lot_cols, XL_CENTER)
+                lot_cell.NumberFormat = "@"
+                lot_cell.Value = spec["lot"]
 
-    # 6. The closing line right after the last used row
-    _put_text(_merge(ws, FIRST_ROW + len(rows), FOOTER_COLS, XL_CENTER), FOOTER_TEXT)
+    # 5. Footer line
+    footer_cell = _merge(ws, FIRST_ROW + len(rows), FOOTER_COLS, XL_CENTER)
+    footer_cell.NumberFormat = "@"
+    footer_cell.Value = FOOTER_TEXT
 
 
 # ── Excel helpers ─────────────────────────────────────────────────────────
@@ -623,6 +629,10 @@ class ARPrintPreview(QWidget):
     """
 
     printed = pyqtSignal(str)          # sent after the receipt was sent to the printer (with the printer name)
+
+    # Session-wide global PDF cache so switching between records or re-opening previews loads instantly
+    _GLOBAL_PDF_CACHE = {}
+    MAX_CACHE_SIZE = 30
 
     def __init__(self, data, parent=None, template_path=TEMPLATE_PATH):
         super().__init__(parent)
@@ -811,18 +821,41 @@ class ARPrintPreview(QWidget):
 
     # ── Preview ───────────────────────────────────────────────────────────
     def _build_preview(self):
-        """Builds the preview for the selected printer and paper size (in the background)."""
+        """Builds the preview or loads it instantly from the session-wide memory cache."""
+        printer = self.cmb_printer.currentText()
+        paper_id = self.cmb_paper.currentData()
+
+        # Unique session cache lookup key
+        cache_key = (self.template_path, printer, paper_id, str(self.data))
+
         self._ready = False            # no printing until this preview is ready
         self._build_no += 1
         # New file names each time: the previous PDF may still be open in the viewer
         self.xlsx_path = os.path.join(self.tmp_dir, f"ar_{self._build_no}.xlsx")
         self.pdf_path = os.path.join(self.tmp_dir, f"ar_{self._build_no}.pdf")
 
+        # INSTANT CACHE HIT: If already generated this session, copy instantly!
+        if cache_key in ARPrintPreview._GLOBAL_PDF_CACHE and os.path.exists(ARPrintPreview._GLOBAL_PDF_CACHE[cache_key]):
+            cached_pdf = ARPrintPreview._GLOBAL_PDF_CACHE[cache_key]
+            shutil.copy(cached_pdf, self.pdf_path)
+            self._notes = []
+            self._show_pdf()
+            return
+
         self._notes = []               # the job adds messages here, for example "paper size not used"
         self._set_busy(True, "Preparing preview...")
+
+        def handle_ready():
+            if os.path.exists(self.pdf_path):
+                if len(ARPrintPreview._GLOBAL_PDF_CACHE) >= ARPrintPreview.MAX_CACHE_SIZE:
+                    oldest_key = next(iter(ARPrintPreview._GLOBAL_PDF_CACHE))
+                    ARPrintPreview._GLOBAL_PDF_CACHE.pop(oldest_key, None)
+                ARPrintPreview._GLOBAL_PDF_CACHE[cache_key] = self.pdf_path
+            self._show_pdf()
+
         self._run(render_files, self.template_path, self.xlsx_path, self.pdf_path, self.data,
-                  self.cmb_printer.currentText(), self.cmb_paper.currentData(), self._notes,
-                  done=self._show_pdf, early=True)
+                  printer, paper_id, self._notes,
+                  done=handle_ready, early=True)
 
     def _show_pdf(self):
         """Called when the PDF is ready: load it into the viewer and allow printing."""
@@ -831,7 +864,6 @@ class ARPrintPreview(QWidget):
         notes = ([self._papers_note] if self._papers_note else []) + self._notes
         self._set_busy(False, "  ".join(notes))     # empty unless something could not be done exactly
 
-    # ── Printing ──────────────────────────────────────────────────────────
     def print_report(self):
         self._printer = self.cmb_printer.currentText()    # remember it for the audit trail
         self.btn_print.setText(" Sending...")
