@@ -209,11 +209,11 @@ class AREntryTab(QWidget):
         # Converted to multi-line QTextEdit for longer inputs
         self.txt_lot = QTextEdit()
         self.txt_lot.setPlaceholderText("Optional (Lot number details)")
-        self.txt_lot.setFixedHeight(50)
+        self.txt_lot.setFixedHeight(60)
 
         self.txt_note = QTextEdit()
         self.txt_note.setPlaceholderText("Optional (Notes or instructions)")
-        self.txt_note.setFixedHeight(65)
+        self.txt_note.setFixedHeight(75)
 
         # Force uppercase handling for text boxes and text areas
         _force_uppercase_edit(self.txt_customer)
