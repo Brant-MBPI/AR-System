@@ -6,7 +6,7 @@ from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame, QAbstractItemView,
-    QMessageBox, QDateEdit, QDoubleSpinBox, QComboBox, QCompleter
+    QMessageBox, QDateEdit, QDoubleSpinBox, QComboBox, QCompleter, QTextEdit
 )
 
 from db.read.ar_report import (get_customers, get_next_ar_no, get_receipt, get_receipt_items,
@@ -22,12 +22,18 @@ MAX_ITEMS = 5
 UNITS = ["KG.", "PC.", "PCS.", "MGS.", "GMS.", "SET.", "SETS."]
 COLUMNS = ["Qty", "Unit", "Product Code", "Product Color", "Lot No.", "Note"]
 
-MODE_IDLE = "idle"      # nothing loaded, form locked, Save disabled
-MODE_NEW = "new"        # after New: editable, Save enabled
-MODE_VIEW = "view"      # record loaded, read only, Save disabled
+# Table columns that are kept (and printed) but not shown in the items table.
+# Click a row and its color and lot number appear in the form on the left.
+HIDDEN_COLUMNS = (3, 4)  # 3 = Product Color, 4 = Lot No.
+
+ITEM_PANEL_WIDTH = 440  # width of the item form on the left (in pixels)
+
+MODE_IDLE = "idle"  # nothing loaded, form locked, Save disabled
+MODE_NEW = "new"  # after New: editable, Save enabled
+MODE_VIEW = "view"  # record loaded, read only, Save disabled
 MODE_UPDATE = "update"  # record loaded, editable, Save becomes Update
 
-PRINT_MODES = (MODE_VIEW, MODE_UPDATE)   # modes in which the Print buttons are enabled
+PRINT_MODES = (MODE_VIEW, MODE_UPDATE)  # modes in which the Print buttons are enabled
 
 TITLES = {
     MODE_IDLE: ("Acknowledgement Receipt Entry",
@@ -38,46 +44,80 @@ TITLES = {
     MODE_UPDATE: ("Update Acknowledgement Receipt", "Change the details below, then click Update to save"),
 }
 
+# ── Look of the input boxes ───────────────────────────────────────────────
+# Required boxes get a warm yellow background and border;
+# when disabled (View mode), they keep a soft readable background so values stand out.
+_INPUT_REQUIRED_QSS = """
+{w} {{ background: #f3ef96; border: 2px solid #FCD34D; border-radius: 8px; padding: 5px; color: #0F172A; }}
+{w}:hover {{ border: 2px solid #F59E0B; }}
+{w}:focus {{ background: #FFFFFF; border: 2px solid #0D9488; }}
+{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; -webkit-text-fill-color: #1E293B; }}
+"""
+_INPUT_OPTIONAL_QSS = """
+{w} {{ background: #f3ef96; border: 2px solid #FDE68A; border-radius: 8px; padding: 5px; color: #0F172A; }}
+{w}:hover {{ border: 2px solid #F59E0B; }}
+{w}:focus {{ background: #FFFFFF; border: 2px solid #0D9488; }}
+{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; -webkit-text-fill-color: #1E293B; }}
+"""
+
+_ITEMS_TABLE_QSS = """
+QTableWidget { border: none; selection-background-color: #E6FAF6; selection-color: #0F172A; }
+QTableWidget::item:selected { background-color: #E6FAF6; color: #0F172A; font-weight: 400;
+                              border-bottom: 1px solid #CBD5E1; }
+"""
+
 
 def _icon(name, color, active=None):
     return fa.icon(name, color=color, color_active=active or color, color_disabled="#94A3B8")
 
 
-def _force_uppercase(edit):
-    """Turns everything the user types or pastes into this text box into UPPERCASE.
+def _style_input(widget, required=True):
+    template = _INPUT_REQUIRED_QSS if required else _INPUT_OPTIONAL_QSS
+    widget.setStyleSheet(template.format(w=type(widget).__name__))
 
-    textEdited is only sent when the USER changes the text (typing, pasting), not when the
-    program fills the box (for example when a receipt is loaded), so loaded data is shown as saved.
-    """
+
+def _force_uppercase_edit(edit):
     def to_upper(text):
         upper = text.upper()
         if upper != text:
-            position = edit.cursorPosition()      # keep the cursor where the user was typing
+            position = edit.cursorPosition()
             edit.setText(upper)
             edit.setCursorPosition(position)
 
     edit.textEdited.connect(to_upper)
 
 
+def _force_uppercase_textedit(edit):
+    def to_upper():
+        cursor = edit.textCursor()
+        pos = cursor.position()
+        text = edit.toPlainText()
+        upper = text.upper()
+        if upper != text:
+            edit.setPlainText(upper)
+            cursor.setPosition(min(pos, len(upper)))
+            edit.setTextCursor(cursor)
+
+    edit.textChanged.connect(to_upper)
+
+
 class AREntryTab(QWidget):
     """AR Entry: customer info + up to 5 item lines. Modes: idle / new / view / update."""
 
-    saved = pyqtSignal(int)        # ar_no
+    saved = pyqtSignal(int)  # ar_no
     close_requested = pyqtSignal()
 
     def __init__(self, username="Brant"):
         super().__init__()
         self.username = username
-        # The PC this window is running on. Only for the audit trail, never shown in Prepared By.
         self.pc_name = socket.gethostname()
-        # The user's OWN hostname saved in tbl_user. This is what Prepared By shows and saves.
         self.db_hostname = self._load_db_hostname()
         self.mode = MODE_IDLE
         self._current_ar_no = None
         self._loaded_snapshot = None
         self._loaded = None
-        self._filling = False        # True while fields are set by code, not by the user
-        self._item_dirty = False     # True when the user edited the item fields
+        self._filling = False
+        self._item_dirty = False
         self.customer_model = QStringListModel(self)
         self._build_ui()
         self.reset_form()
@@ -86,8 +126,8 @@ class AREntryTab(QWidget):
     # ── UI ────────────────────────────────────────────────────────────────
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(12)
 
         # Heading
         self.lbl_title = QLabel("")
@@ -100,13 +140,13 @@ class AREntryTab(QWidget):
         head.addWidget(self.lbl_subtitle)
         root.addLayout(head)
 
-        # Top row: customer info + summary
+        # ── Top row: customer info + receipt summary ──
         top = QHBoxLayout()
-        top.setSpacing(16)
+        top.setSpacing(12)
 
         info_card, info_body = self._card("CUSTOMER INFORMATION")
         row = QHBoxLayout()
-        row.setSpacing(16)
+        row.setSpacing(12)
         self.txt_customer = QLineEdit()
         self.txt_customer.setPlaceholderText("Customer name")
         completer = QCompleter(self.customer_model, self)
@@ -142,11 +182,13 @@ class AREntryTab(QWidget):
         top.addWidget(sum_card, 1)
         root.addLayout(top)
 
-        # Item details card
+        # ── Middle: item form on the LEFT, items table on the RIGHT ──
+        middle = QHBoxLayout()
+        middle.setSpacing(12)
+
+        # Left: item details form
         item_card, item_body = self._card("ITEM DETAILS")
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(12)
+        item_card.setFixedWidth(ITEM_PANEL_WIDTH)
 
         self.spin_qty = QDoubleSpinBox()
         self.spin_qty.setDecimals(2)
@@ -160,39 +202,62 @@ class AREntryTab(QWidget):
 
         self.txt_code = QLineEdit()
         self.txt_code.setPlaceholderText("e.g. RA16846E")
+
         self.txt_color = QLineEdit()
         self.txt_color.setPlaceholderText("e.g. RED")
-        self.txt_lot = QLineEdit()
-        self.txt_lot.setPlaceholderText("Optional")
-        self.txt_note = QLineEdit()
-        self.txt_note.setPlaceholderText("Optional")
 
-        # Everything typed in the text boxes becomes UPPERCASE (customer, code, color, lot, note)
-        for edit in (self.txt_customer, self.txt_code, self.txt_color, self.txt_lot, self.txt_note):
-            _force_uppercase(edit)
+        # Converted to multi-line QTextEdit for longer inputs
+        self.txt_lot = QTextEdit()
+        self.txt_lot.setPlaceholderText("Optional (Lot number details)")
+        self.txt_lot.setFixedHeight(50)
 
-        grid.addLayout(self._field("Quantity", self.spin_qty, True), 0, 0)
-        grid.addLayout(self._field("Unit", self.cmb_unit, True), 0, 1)
-        grid.addLayout(self._field("Product Code", self.txt_code, True), 0, 2)
-        grid.addLayout(self._field("Product Color", self.txt_color, True), 0, 3)
-        grid.addLayout(self._field("Lot No.", self.txt_lot), 1, 0, 1, 2)
-        grid.addLayout(self._field("Note", self.txt_note), 1, 2, 1, 2)
-        for col, stretch in enumerate((1, 1, 2, 2)):
-            grid.setColumnStretch(col, stretch)
-        item_body.addLayout(grid)
+        self.txt_note = QTextEdit()
+        self.txt_note.setPlaceholderText("Optional (Notes or instructions)")
+        self.txt_note.setFixedHeight(65)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+        # Force uppercase handling for text boxes and text areas
+        _force_uppercase_edit(self.txt_customer)
+        _force_uppercase_edit(self.txt_code)
+        _force_uppercase_edit(self.txt_color)
+        _force_uppercase_textedit(self.txt_lot)
+        _force_uppercase_textedit(self.txt_note)
+
+        # Styles
+        for w in (self.txt_customer, self.date_ar, self.spin_qty, self.cmb_unit,
+                  self.txt_code, self.txt_color):
+            _style_input(w, required=True)
+        for w in (self.txt_lot, self.txt_note):
+            _style_input(w, required=False)
+
+        # Layout configuration: Product Color is now directly underneath Product Code
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+
+        form.addLayout(self._field("Quantity", self.spin_qty, True), 0, 0)
+        form.addLayout(self._field("Unit", self.cmb_unit, True), 0, 1)
+
+        form.addLayout(self._field("Product Code", self.txt_code, True), 1, 0, 1, 2)
+        form.addLayout(self._field("Product Color", self.txt_color, True), 2, 0, 1, 2)
+
+        form.addLayout(self._field("Lot No.", self.txt_lot), 3, 0, 1, 2)
+        form.addLayout(self._field("Note", self.txt_note), 4, 0, 1, 2)
+
+        form.setColumnStretch(0, 1)
+        form.setColumnStretch(1, 1)
+        item_body.addLayout(form)
+
         self.lbl_hint = QLabel("")
         self.lbl_hint.setObjectName("SubtitleLabel")
-        actions.addWidget(self.lbl_hint)
-        actions.addStretch(1)
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setMinimumHeight(32)
+        self.lbl_hint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        item_body.addWidget(self.lbl_hint)
 
         self.btn_add = QPushButton(" Add", icon=_icon("fa5s.plus", "white"))
         self.btn_add.setObjectName("PrimaryButton")
         self.btn_add.clicked.connect(self.add_item)
 
-        # Replaces the selected row with what is in the fields (same position in the table)
         self.btn_update_item = QPushButton(" Update Item", icon=_icon("fa5s.edit", "white"))
         self.btn_update_item.setObjectName("WarningButton")
         self.btn_update_item.clicked.connect(self.update_item)
@@ -204,12 +269,19 @@ class AREntryTab(QWidget):
         self.btn_clear = QPushButton(" Clear", icon=_icon("fa5s.eraser", "#334155"))
         self.btn_clear.clicked.connect(self.clear_items)
 
-        for b in (self.btn_add, self.btn_update_item, self.btn_remove, self.btn_clear):
-            actions.addWidget(b)
-        item_body.addLayout(actions)
-        root.addWidget(item_card)
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(8)
+        buttons.setVerticalSpacing(8)
+        buttons.addWidget(self.btn_add, 0, 0)
+        buttons.addWidget(self.btn_update_item, 0, 1)
+        buttons.addWidget(self.btn_remove, 1, 0)
+        buttons.addWidget(self.btn_clear, 1, 1)
+        item_body.addLayout(buttons)
+        item_body.addStretch(1)
+        middle.addWidget(item_card)
 
-        # Items table
+        # Right: the items of this receipt
+        list_card, list_body = self._card("ITEMS ON THIS RECEIPT")
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.verticalHeader().setVisible(False)
@@ -218,25 +290,27 @@ class AREntryTab(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setStyleSheet(_ITEMS_TABLE_QSS)
         hdr = self.table.horizontalHeader()
         hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)  # Note
-        for col, width in {0: 120, 1: 90, 2: 220, 3: 180, 4: 160}.items():
+        for col, width in {0: 90, 1: 70, 2: 150, 3: 130, 4: 130}.items():
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
             self.table.setColumnWidth(col, width)
-        root.addWidget(self.table, 1)
+        for col in HIDDEN_COLUMNS:
+            self.table.setColumnHidden(col, True)
+        list_body.addWidget(self.table, 1)
+        middle.addWidget(list_card, 1)
 
-        # Footer
+        root.addLayout(middle, 1)
+
+        # ── Footer ──
         footer = QHBoxLayout()
         footer.setSpacing(8)
         footer.addStretch(1)
 
-        # Print Wide uses the template with the wider product code column.
-        # The buttons use a lambda because clicked sends a True/False value we do not want in `wide`.
         self.btn_print_wide = QPushButton(" Print Wide", icon=_icon("fa5s.print", "white"))
         self.btn_print_wide.setObjectName("SecondaryButton")
         self.btn_print_wide.clicked.connect(lambda: self.print_receipt(wide=True))
-        # Ctrl+P = Print Wide. A button shortcut only works while the button is enabled and
-        # visible, so it follows the same rules as clicking the button.
         self.btn_print_wide.setShortcut(QKeySequence("Ctrl+P"))
         self.btn_print_wide.setToolTip("Print Wide  (Ctrl+P)")
 
@@ -267,17 +341,20 @@ class AREntryTab(QWidget):
         # Live validation / state
         self.spin_qty.valueChanged.connect(self._on_field_changed)
         self.cmb_unit.currentIndexChanged.connect(self._on_field_changed)
-        for w in (self.txt_code, self.txt_color, self.txt_lot, self.txt_note):
+        for w in (self.txt_code, self.txt_color):
             w.textChanged.connect(self._on_field_changed)
             w.returnPressed.connect(self.add_item)
+        for w in (self.txt_lot, self.txt_note):
+            w.textChanged.connect(self._on_field_changed)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
 
     def _card(self, title):
         frame = QFrame()
         frame.setObjectName("Card")
+        frame.setStyleSheet("QFrame#Card { padding: 4px; }")
         body = QVBoxLayout(frame)
-        body.setContentsMargins(8, 8, 8, 8)
-        body.setSpacing(12)
+        body.setContentsMargins(6, 6, 6, 6)
+        body.setSpacing(8)
         lbl = QLabel(title)
         lbl.setObjectName("CardTitle")
         body.addWidget(lbl)
@@ -285,7 +362,7 @@ class AREntryTab(QWidget):
 
     def _field(self, caption, widget, required=False):
         box = QVBoxLayout()
-        box.setSpacing(4)
+        box.setSpacing(3)
         text = caption + (' <span style="color:#EF4444">*</span>' if required else "")
         lbl = QLabel(text)
         lbl.setObjectName("FieldLabel")
@@ -301,29 +378,16 @@ class AREntryTab(QWidget):
 
     # ── Prepared By ───────────────────────────────────────────────────────
     def _load_db_hostname(self):
-        """The hostname saved for this user in the database (not the name of this PC)."""
         try:
             return get_user_hostname(self.username)
         except Exception:
             return None
 
     def _me(self):
-        """'Hostname\\Username' with the user's own hostname from the database.
-
-        This is what Prepared By shows and what is saved with the receipt. If the user has
-        no hostname saved yet, it is just the username.
-        """
         return f"{self.db_hostname}\\{self.username}" if self.db_hostname else self.username
 
     def _prepared_by_fullname(self):
-        """The full name of whoever is written in Prepared By, for the printed form.
-
-        Prepared By looks like 'Hostname\\Username'. We split it at the backslash, find the
-        user with that hostname and username in tbl_user, and return 'First Last'.
-        If nobody matches (for example old records), the text is returned as it is.
-        """
         text = self.lbl_by.text()
-        # No backslash in the text: hostname is "" and username is the whole text
         hostname, _, username = text.rpartition("\\")
         try:
             return get_user_fullname(hostname.strip(), username.strip()) or text
@@ -359,13 +423,11 @@ class AREntryTab(QWidget):
         self.lbl_count.setText(f"{n} / {MAX_ITEMS}")
         row_selected = self._selected_row() is not None
         self.btn_add.setEnabled(editable and self._fields_valid() and not full)
-        # Needs a selected row and valid fields; works even when the receipt is full
         self.btn_update_item.setEnabled(editable and row_selected and self._fields_valid())
         self.btn_remove.setEnabled(editable and row_selected)
         self.btn_clear.setEnabled(editable and n > 0)
         self.btn_save.setEnabled(editable)
 
-        # Both print buttons follow the same rule
         can_print = self.mode in PRINT_MODES and self._current_ar_no is not None and n > 0
         self.btn_print.setEnabled(can_print)
         self.btn_print_wide.setEnabled(can_print)
@@ -409,7 +471,7 @@ class AREntryTab(QWidget):
 
     # ── Item fields / table ───────────────────────────────────────────────
     def _set_fields(self, qty=0.0, unit=None, code="", color="", lot="", note=""):
-        """Set the item fields from code (not user edits). Empty call = clear."""
+        """Set the item fields from code (using toPlainText for text edits)."""
         self._filling = True
         try:
             self.spin_qty.setValue(qty)
@@ -421,8 +483,8 @@ class AREntryTab(QWidget):
                 self.cmb_unit.setCurrentIndex(idx)
             self.txt_code.setText(code)
             self.txt_color.setText(color)
-            self.txt_lot.setText(lot)
-            self.txt_note.setText(note)
+            self.txt_lot.setPlainText(lot)
+            self.txt_note.setPlainText(note)
         finally:
             self._filling = False
         self._item_dirty = False
@@ -447,12 +509,10 @@ class AREntryTab(QWidget):
             self._refresh_state()
 
     def _write_row(self, r, qty, unit, code, color, lot, note):
-        """Put the values into table row r. Cells that already exist are changed in place,
-        so an updated row keeps its position."""
         values = [f"{qty:,.2f}", unit, code, color, lot, note]
         for c, text in enumerate(values):
             item = self.table.item(r, c)
-            if item is None:                      # a brand new row: create its cells
+            if item is None:
                 item = QTableWidgetItem()
                 if c == 0:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -461,7 +521,7 @@ class AREntryTab(QWidget):
                 self.table.setItem(r, c, item)
             item.setText(text)
             if c == 0:
-                item.setData(Qt.ItemDataRole.UserRole, qty)   # the exact number, used when saving
+                item.setData(Qt.ItemDataRole.UserRole, qty)
 
     def _append_row(self, qty, unit, code, color, lot, note):
         r = self.table.rowCount()
@@ -477,8 +537,8 @@ class AREntryTab(QWidget):
             self.cmb_unit.currentText(),
             self.txt_code.text().strip().upper(),
             self.txt_color.text().strip().upper(),
-            self.txt_lot.text().strip(),
-            self.txt_note.text().strip(),
+            self.txt_lot.toPlainText().strip(),
+            self.txt_note.toPlainText().strip(),
         )
         self.table.clearSelection()
         self._set_fields()
@@ -486,7 +546,6 @@ class AREntryTab(QWidget):
         self.spin_qty.selectAll()
 
     def update_item(self):
-        """Replace the selected row with the values in the item fields (same position)."""
         row = self._selected_row()
         if row is None or not self.btn_update_item.isEnabled():
             return
@@ -497,8 +556,8 @@ class AREntryTab(QWidget):
             self.cmb_unit.currentText(),
             self.txt_code.text().strip().upper(),
             self.txt_color.text().strip().upper(),
-            self.txt_lot.text().strip(),
-            self.txt_note.text().strip(),
+            self.txt_lot.toPlainText().strip(),
+            self.txt_note.toPlainText().strip(),
         )
         self.table.clearSelection()
         self._set_fields()
@@ -509,7 +568,7 @@ class AREntryTab(QWidget):
         row = self._selected_row()
         if row is None:
             return
-        self.table.removeRow(row)   # the fields keep the removed item's values for re-editing
+        self.table.removeRow(row)
         self.table.clearSelection()
         self._refresh_state()
 
@@ -536,7 +595,6 @@ class AREntryTab(QWidget):
             self.customer_model.setStringList([])
 
     def load_record(self, ar_no, mode):
-        """Open an existing receipt in MODE_VIEW or MODE_UPDATE. Returns True when loaded."""
         if self.has_unsaved() and not self._confirm(
                 "Discard Changes", "Discard the receipt currently being entered?"):
             return False
@@ -609,9 +667,6 @@ class AREntryTab(QWidget):
             "ar_date": self.date_ar.date().toPyDate(),
             "customer": customer[:128],
             "t_items": len(items),
-            # 'Hostname\Username': saved as encoded_by (new receipt) or updated_by (update).
-            # It is the logged-in user, not the Prepared By text, which shows the original
-            # preparer while a receipt is being updated.
             "user": self._me()[:128],
         }
 
@@ -638,40 +693,27 @@ class AREntryTab(QWidget):
         QMessageBox.information(
             self, "Saved",
             f"Acknowledgement Receipt {ar_no:07d} {'updated' if updating else 'saved'}.")
-        self.saved.emit(ar_no)                       # refreshes the list in the Record tab
-        self._continue_with_saved(ar_no, header)     # stay on this receipt, ready to print or update again
+        self.saved.emit(ar_no)
+        self._continue_with_saved(ar_no, header)
         if updating:
-            self.close_requested.emit()   # back to the Record tab
+            self.close_requested.emit()
 
     def _continue_with_saved(self, ar_no, header):
-        """Keeps the receipt that was just saved on screen, as if it was opened with Update.
-
-        That way it can be printed right away (Print is enabled in Update mode), and changing
-        it again and clicking Update saves those changes to the same receipt.
-        """
         self._current_ar_no = ar_no
         self.txt_ar_no.setText(f"{ar_no:07d}")
-        self.txt_customer.setText(header["customer"])     # shown exactly as it was saved
+        self.txt_customer.setText(header["customer"])
 
-        # The form is now the saved version: it is what "unsaved changes" is compared with,
-        # and what the next update's audit text compares against
         self._loaded_snapshot = self._snapshot()
         self._loaded = {"customer": header["customer"], "ar_date": header["ar_date"],
                         "items": self._items_from_table()}
 
         self.table.clearSelection()
-        self._set_fields()                                # empty item fields, nothing selected
-        self._set_mode(MODE_UPDATE)                       # title, Update button and Print buttons
+        self._set_fields()
+        self._set_mode(MODE_UPDATE)
 
-    # ── Printing ──────────────────────────────────────────────────────────
     def print_receipt(self, wide=False):
-        """Open the print preview for the receipt shown in the form.
-
-        wide=True uses the template with the wider product code column.
-        """
         if self.mode not in PRINT_MODES or self._current_ar_no is None:
             return
-        # While updating, the print shows what is on screen, which may not be saved yet
         if self.mode == MODE_UPDATE and self.has_unsaved() and not self._confirm(
                 "Unsaved Changes",
                 "This receipt has changes that are not saved yet.\nPrint it as shown now?"):
@@ -686,23 +728,20 @@ class AREntryTab(QWidget):
             ar_no=self._current_ar_no,
             ar_date=self.date_ar.date().toPyDate(),
             customer=self.txt_customer.text(),
-            prepared_by=self._prepared_by_fullname(),   # the full name, not 'Hostname\Username'
+            prepared_by=self._prepared_by_fullname(),
             items=rows,
         )
         preview = ARPrintPreview(data, parent=self.window(),
                                  template_path=TEMPLATE_WIDE_PATH if wide else TEMPLATE_PATH)
-        # The preview tells us when the receipt was really sent to the printer
         preview.printed.connect(lambda printer, d=data: self._log_print(d, printer))
         preview.show()
 
     def _log_print(self, data, printer):
-        """Audit trail entry for a receipt that was sent to the printer."""
         log_action("PRINT",
                    f"AR NO: {data['ar_no']} for customer {data['customer']} "
                    f"with {data['item_count']} item(s) printed on {printer}",
                    username=self.username, mac_address=workstation_mac())
 
-    # ── Form lifecycle ────────────────────────────────────────────────────
     def _clear_all(self):
         self.txt_customer.clear()
         self.date_ar.setDate(QDate.currentDate())
@@ -717,7 +756,6 @@ class AREntryTab(QWidget):
         self.lbl_by.setText(self._me())
 
     def reset_form(self):
-        """Back to the idle, locked state."""
         self._clear_all()
         self._current_ar_no = None
         self._loaded_snapshot = None
