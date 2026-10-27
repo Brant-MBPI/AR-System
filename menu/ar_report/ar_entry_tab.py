@@ -1,7 +1,7 @@
 import socket
 
 import qtawesome as fa
-from PyQt6.QtCore import Qt, QDate, QStringListModel, pyqtSignal
+from PyQt6.QtCore import Qt, QDate, QEvent, QObject, QStringListModel, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit, QPushButton,
@@ -51,13 +51,18 @@ _INPUT_REQUIRED_QSS = """
 {w} {{ background: #f3ef96; border: 2px solid #FCD34D; border-radius: 8px; padding: 5px; color: #0F172A; }}
 {w}:hover {{ border: 2px solid #F59E0B; }}
 {w}:focus {{ background: #FFFFFF; border: 2px solid #0D9488; }}
-{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; -webkit-text-fill-color: #1E293B; }}
+{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; }}
 """
 _INPUT_OPTIONAL_QSS = """
 {w} {{ background: #f3ef96; border: 2px solid #FDE68A; border-radius: 8px; padding: 5px; color: #0F172A; }}
 {w}:hover {{ border: 2px solid #F59E0B; }}
 {w}:focus {{ background: #FFFFFF; border: 2px solid #0D9488; }}
-{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; -webkit-text-fill-color: #1E293B; }}
+{w}:disabled {{ background: #f3ef96; color: #1E293B; border: 2px solid #E2E8F0; }}
+"""
+
+# Added after the normal style while a multi-line box has focus (see _FocusBackground).
+_FOCUSED_QSS = """
+{w} {{ background: #FFFFFF; border: 2px solid #0D9488; }}
 """
 
 _ITEMS_TABLE_QSS = """
@@ -71,9 +76,39 @@ def _icon(name, color, active=None):
     return fa.icon(name, color=color, color_active=active or color, color_disabled="#94A3B8")
 
 
+class _FocusBackground(QObject):
+    """Makes a multi-line box (QTextEdit) turn white while it has focus.
+
+    A QTextEdit paints its text area with a color that Qt works out once, when the style
+    sheet is applied. The ":focus" rule can change the border but never reaches that color,
+    so the box stayed yellow. Here the whole style sheet is swapped when focus comes and goes,
+    which makes Qt work out the color again.
+    """
+
+    def __init__(self, edit, normal_qss, focused_qss):
+        super().__init__(edit)                 # belongs to the box, so it lives as long as the box
+        self._edit = edit
+        self._normal_qss = normal_qss
+        self._focused_qss = focused_qss
+        edit.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if obj is self._edit:
+            if event.type() == QEvent.Type.FocusIn:
+                self._edit.setStyleSheet(self._focused_qss)
+            elif event.type() == QEvent.Type.FocusOut:
+                self._edit.setStyleSheet(self._normal_qss)
+        return False                           # never block the event
+
+
 def _style_input(widget, required=True):
     template = _INPUT_REQUIRED_QSS if required else _INPUT_OPTIONAL_QSS
-    widget.setStyleSheet(template.format(w=type(widget).__name__))
+    name = type(widget).__name__
+    normal = template.format(w=name)
+    widget.setStyleSheet(normal)
+    if isinstance(widget, QTextEdit):
+        # The same style plus a later rule that wins: white background, teal border
+        _FocusBackground(widget, normal, normal + _FOCUSED_QSS.format(w=name))
 
 
 def _force_uppercase_edit(edit):
