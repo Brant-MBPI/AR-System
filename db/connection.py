@@ -1,25 +1,27 @@
+import os
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
 import psycopg2
+def load_environment():
+    if getattr(sys, 'frozen', False):
+        # Running as compiled .exe (PyInstaller)
+        base_path = Path(sys.executable).parent
+    else:
+        # Running as normal Python script
+        base_path = Path(__file__).resolve().parent.parent
 
+    env_path = base_path / ".env"
+    load_dotenv(env_path)
 
-# localhost
-# def get_connection():
-#     # localhost
-#     return psycopg2.connect(
-#         host="localhost",
-#         dbname="db_ar",
-#         user="postgres",
-#         password="password",
-#         port="5433"
-#     )
+load_environment()
 
-
-# Server
 def get_connection():
     # localhost
     return psycopg2.connect(
-        host="192.168.1.13",
-        dbname="db_ar",
-        user="postgres",
-        password="mbpi",
-        port="5432"
+        host=os.environ.get('DB_HOST'),
+        dbname=os.environ.get('DB_NAME'),
+        user=os.environ.get('DB_USER'),
+        password=os.environ.get('DB_PASSWORD'),
+        port=os.environ.get('DB_PORT')
     )

@@ -8,3 +8,4 @@ dbfread==2.0.7
 psutil==7.2.2
 openpyxl==3.2.0b1
 pywin32==312
+python-dotenv==1.2.4

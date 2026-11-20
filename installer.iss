@@ -3,8 +3,8 @@
 ; MyAppExe: the exe name
 ; MySourceDir: the folder containing that exe and its _internal.
 
-#define MyAppName "MBPI AR"
-#define MyAppVersion "1.6.0"
+#define MyAppName "MBPI Lab AR"
+#define MyAppVersion "1.6.1"
 #define MyAppId "MBPI_AR_System"
 #define MyAppExe "main.exe"
 #define MySourceDir "output\main"
